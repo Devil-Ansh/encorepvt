@@ -23,15 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: |
-          pip install \
-            Appium-Python-Client==3.1.1 \
-            selenium \
-            google-cloud-firestore \
-            google-auth \
-            cryptography \
-            pyotp \
-            requests
+        run: pip install Appium-Python-Client==3.1.1 selenium google-cloud-firestore google-auth cryptography pyotp requests
 
       - name: Set up JDK (required by Appium)
         uses: actions/setup-java@v4
@@ -47,13 +39,26 @@ jobs:
 
       - name: Enable KVM for hardware acceleration
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      - name: Start Appium server
+        run: |
+          appium --address 127.0.0.1 --port 4723 --log /tmp/appium.log &
+          echo "Appium PID=$!" >> $GITHUB_ENV
+          sleep 3
+          echo "Appium started"
+
       - name: Run automation with Android emulator
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FIRESTORE_DATABASE: ${{ secrets.FIRESTORE_DATABASE }}
         with:
           api-level: 34
           target: google_apis
@@ -61,22 +66,9 @@ jobs:
           profile: Nexus 6
           avd-name: Pixel10
           force-avd-creation: false
-          emulator-options: >
-            -no-window
-            -gpu swiftshader_indirect
-            -noaudio
-            -no-boot-anim
-            -camera-back none
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          pre-emulator-launch-script: |
-            # Start Appium in background
-            appium --address 127.0.0.1 --port 4723 \
-              --log /tmp/appium.log &
-            echo "Appium started"
-          script: |
-            echo "=== Starting Gmail automation for job ${{ github.event.inputs.job_id }} ==="
-            python3 services/device_automation/run_automation.py \
-              --job-id "${{ github.event.inputs.job_id }}"
+          script: python3 services/device_automation/run_automation.py --job-id "$JOB_ID"
 
       - name: Upload Appium logs on failure
         if: failure()
