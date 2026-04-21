@@ -44,7 +44,6 @@ jobs:
           unzip -o chromedriver_linux64.zip
           chmod +x chromedriver
           echo "CHROMEDRIVER_PATH=/tmp/chromedriver" >> $GITHUB_ENV
-          echo "ChromeDriver 113 ready at /tmp/chromedriver"
           /tmp/chromedriver --version
 
       - name: Enable KVM for hardware acceleration
@@ -74,7 +73,8 @@ jobs:
           api-level: 34
           target: google_apis
           arch: x86_64
-          profile: Nexus 6
+          # pixel_6_pro is the closest available profile — we spoof model via ADB in the script
+          profile: pixel_6_pro
           avd-name: Pixel10
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
