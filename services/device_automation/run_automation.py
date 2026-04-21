@@ -188,17 +188,26 @@ def _connect_chrome(retries: int = 5, wait: int = 10):
     else:
         options.set_capability("chromedriverAutodownload", True)
 
-    # Chrome args to prevent SwiftShader crash (passed via Appium to ChromeDriver)
-    options.set_capability("chromedriverArgs", [
-        "--disable-gpu",
-        "--disable-gpu-compositing",
-        "--disable-gpu-rasterization",
-        "--in-process-gpu",
-        "--disable-accelerated-2d-canvas",
-        "--disable-accelerated-video-decode",
-        "--disable-webgl",
-        "--disable-dev-shm-usage",
-    ])
+    # Pass args directly to Chrome (NOT ChromeDriver) via goog:chromeOptions
+    # This prevents the SwiftShader / Vulkan crash that occurs when Chrome
+    # renders GPU-heavy pages (like Google sign-in) on the Android emulator.
+    options.set_capability("goog:chromeOptions", {
+        "args": [
+            "--disable-gpu",
+            "--disable-gpu-compositing",
+            "--disable-gpu-rasterization",
+            "--in-process-gpu",
+            "--disable-accelerated-2d-canvas",
+            "--disable-accelerated-video-decode",
+            "--disable-accelerated-video-encode",
+            "--disable-webgl",
+            "--disable-webgl2",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--use-angle=swiftshader",
+            "--disable-features=Vulkan,VulkanFromANGLE,VulkanShaderModule",
+        ]
+    })
 
     server = "http://127.0.0.1:4723"
     last_exc = None
