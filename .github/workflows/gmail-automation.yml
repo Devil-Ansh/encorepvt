@@ -1,0 +1,87 @@
+name: Gmail Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Firestore job ID to process"
+        required: true
+        type: string
+
+jobs:
+  automate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install \
+            Appium-Python-Client==3.1.1 \
+            selenium \
+            google-cloud-firestore \
+            google-auth \
+            cryptography \
+            pyotp \
+            requests
+
+      - name: Set up JDK (required by Appium)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Appium and UIAutomator2 driver
+        run: |
+          npm install -g appium@3
+          appium driver install uiautomator2
+          appium --version
+
+      - name: Enable KVM for hardware acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run automation with Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: Nexus 6
+          avd-name: Pixel10
+          force-avd-creation: false
+          emulator-options: >
+            -no-window
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+          disable-animations: true
+          pre-emulator-launch-script: |
+            # Start Appium in background
+            appium --address 127.0.0.1 --port 4723 \
+              --log /tmp/appium.log &
+            echo "Appium started"
+          script: |
+            echo "=== Starting Gmail automation for job ${{ github.event.inputs.job_id }} ==="
+            python3 services/device_automation/run_automation.py \
+              --job-id "${{ github.event.inputs.job_id }}"
+
+      - name: Upload Appium logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appium-logs
+          path: /tmp/appium.log
+          retention-days: 3
