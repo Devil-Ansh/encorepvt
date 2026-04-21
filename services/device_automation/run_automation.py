@@ -2,11 +2,11 @@
 run_automation.py — GitHub Actions Android emulator automation.
 
 Flow:
-  1. Sign in to Google via Chrome browser on the Android emulator
-     (Chrome WebDriver bridge — avoids Chrome Custom Tab isolation issues)
-  2. Wait for Android account manager to sync the signed-in account
-  3. Open Google One native app and extract the partner-eft-onboard offer link
-  4. Write result to Firestore and notify the user via Telegram
+  1. Spoof device model as "Pixel 10" via ADB (required for Google One offer)
+  2. Set Chrome command-line flags to prevent SwiftShader GPU crash
+  3. Sign in to Google via Chrome browser on the emulator (ChromeDriver bridge)
+  4. Navigate to Google One app to extract the partner-eft-onboard offer link
+  5. Write result to Firestore and notify the user via Telegram
 """
 import argparse
 import base64
@@ -30,6 +30,8 @@ logger = logging.getLogger("run_automation")
 OFFER_RE = re.compile(
     r'https://one\.google\.com/partner-eft-onboard/[A-Za-z0-9\-._~:/?#@!$&()*+,;=%]+'
 )
+ADB = "/usr/local/lib/android/sdk/platform-tools/adb"
+DEVICE = "emulator-5554"
 
 
 # ---------------------------------------------------------------------------
@@ -98,56 +100,105 @@ def _send_telegram(user_id: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _adb(cmd: str, timeout: int = 30) -> str:
-    full = f"adb -s emulator-5554 {cmd}"
+    full = f"{ADB} -s {DEVICE} {cmd}"
     try:
         result = subprocess.run(
             full, shell=True, capture_output=True, text=True, timeout=timeout
         )
-        return result.stdout.strip()
+        out = result.stdout.strip()
+        if result.returncode != 0 and result.stderr:
+            logger.debug("ADB stderr (%s): %s", cmd[:40], result.stderr.strip()[:100])
+        return out
     except Exception as exc:
-        logger.warning("ADB error (%s): %s", cmd, exc)
+        logger.warning("ADB error (%s): %s", cmd[:40], exc)
         return ""
 
 
-def _wait_for_activity(package: str, timeout: int = 30) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        out = _adb("shell dumpsys activity | grep mResumedActivity")
-        if package in out:
-            return True
-        time.sleep(2)
-    return False
+def _setup_device() -> None:
+    """
+    Spoof device as Pixel 10 and set Chrome flags to prevent SwiftShader crash.
+    Must be called after the emulator is booted.
+    """
+    logger.info("Setting up device as Pixel 10")
 
+    # Root the device (works on google_apis emulator images)
+    subprocess.run(f"{ADB} -s {DEVICE} root", shell=True, timeout=15)
+    time.sleep(2)
 
-def _enable_chrome_debugging() -> None:
-    """Enable remote debugging in Chrome on the emulator."""
-    _adb("shell am set-debug-app --persistent com.android.chrome")
-    _adb('shell am start -n com.android.chrome/com.google.android.apps.chrome.Main '
-         '-a android.intent.action.VIEW -d "about:blank"')
-    time.sleep(3)
+    # --- Spoof device model as Pixel 10 ---
+    props = {
+        "ro.product.model": "Pixel 10",
+        "ro.product.name": "pixel10",
+        "ro.product.device": "pixel10",
+        "ro.product.manufacturer": "Google",
+        "ro.product.brand": "google",
+        "ro.build.fingerprint": "google/pixel10/pixel10:14/AP2A.240905.003/12345678:user/release-keys",
+    }
+    for prop, value in props.items():
+        result = _adb(f'shell setprop {prop} "{value}"')
+        logger.debug("setprop %s = %s → %s", prop, value, result or "ok")
+
+    # Verify
+    model = _adb("shell getprop ro.product.model")
+    logger.info("Device model reported as: %s", model)
+
+    # --- Set Chrome command-line flags to prevent SwiftShader GPU crash ---
+    # These disable GPU compositing features that crash on SwiftShader
+    chrome_flags = (
+        "_ "
+        "--disable-gpu-compositing "
+        "--disable-gpu-rasterization "
+        "--in-process-gpu "
+        "--disable-accelerated-2d-canvas "
+        "--disable-accelerated-video-decode "
+        "--disable-accelerated-video-encode "
+        "--disable-webgl "
+        "--disable-dev-shm-usage "
+        "--disable-features=VizDisplayCompositor"
+    )
+    _adb(f'shell "echo \'{chrome_flags}\' > /data/local/tmp/chrome-command-line"')
+    _adb("shell chmod 555 /data/local/tmp/chrome-command-line")
+    verify = _adb("shell cat /data/local/tmp/chrome-command-line")
+    logger.info("Chrome flags set: %s", verify[:80])
+
+    # Kill any existing Chrome instances so flags take effect
+    _adb("shell am force-stop com.android.chrome")
+    time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
-# Appium driver factory — Chrome mode
+# Appium driver — Chrome mode with crash-prevention capabilities
 # ---------------------------------------------------------------------------
 
-def _connect_chrome(retries: int = 4, wait: int = 10):
-    """Connect Appium to Chrome browser on the emulator via ChromeDriver."""
+def _connect_chrome(retries: int = 5, wait: int = 10):
     from appium import webdriver
     from appium.options.android import UiAutomator2Options
 
     options = UiAutomator2Options()
     options.platform_name = "Android"
-    options.device_name = "emulator-5554"
+    options.device_name = DEVICE
     options.browser_name = "Chrome"
-    options.set_capability("chromedriverAutodownload", True)
     options.new_command_timeout = 300
 
-    # Use pre-downloaded ChromeDriver 113 if available (matches emulator Chrome)
+    # Pre-downloaded ChromeDriver 113 (matches emulator Chrome)
     cd_path = os.environ.get("CHROMEDRIVER_PATH", "")
     if cd_path and os.path.isfile(cd_path):
         logger.info("Using pre-downloaded ChromeDriver: %s", cd_path)
         options.set_capability("chromedriverExecutable", cd_path)
+    else:
+        options.set_capability("chromedriverAutodownload", True)
+
+    # Chrome args to prevent SwiftShader crash (passed via Appium to ChromeDriver)
+    options.set_capability("chromedriverArgs", [
+        "--disable-gpu",
+        "--disable-gpu-compositing",
+        "--disable-gpu-rasterization",
+        "--in-process-gpu",
+        "--disable-accelerated-2d-canvas",
+        "--disable-accelerated-video-decode",
+        "--disable-webgl",
+        "--disable-dev-shm-usage",
+    ])
 
     server = "http://127.0.0.1:4723"
     last_exc = None
@@ -165,130 +216,144 @@ def _connect_chrome(retries: int = 4, wait: int = 10):
 
 
 # ---------------------------------------------------------------------------
-# Google sign-in via Chrome browser
+# Google sign-in via Chrome browser on emulator
 # ---------------------------------------------------------------------------
 
 def _sign_in_via_chrome(driver, email: str, password: str, totp_code: str) -> None:
-    """
-    Sign in to Google account using Chrome browser on the Android emulator.
-    Uses standard Selenium CSS selectors (not native Android elements).
-    """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-    wait = WebDriverWait(driver, 30)
-    short_wait = WebDriverWait(driver, 10)
+    wait = WebDriverWait(driver, 40)
+    short_wait = WebDriverWait(driver, 15)
 
     logger.info("Navigating to Google sign-in")
-    driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
-    time.sleep(3)
+    driver.get("https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn")
+    time.sleep(5)
 
-    # --- Email field ---
-    logger.info("Entering email")
+    # --- Email ---
+    logger.info("Entering email: %s", email)
     email_input = wait.until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR, 'input[type="email"], input[name="identifier"], #identifierId')
+        (By.CSS_SELECTOR, 'input[type="email"]')
     ))
     email_input.clear()
     email_input.send_keys(email)
     time.sleep(1)
 
-    # Click Next
-    for sel in ['#identifierNext', 'button[jsname="LgbsSe"]', 'button[type="button"]']:
-        try:
-            driver.find_element(By.CSS_SELECTOR, sel).click()
-            break
-        except NoSuchElementException:
-            continue
-    time.sleep(3)
+    _click_next_web(driver)
+    logger.info("Email submitted — waiting for password page")
+    time.sleep(5)
 
-    # --- Password field ---
+    # --- Password ---
     logger.info("Entering password")
     pwd_input = wait.until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR, 'input[type="password"], input[name="password"], #password input')
+        (By.CSS_SELECTOR, 'input[type="password"]')
     ))
     pwd_input.clear()
     pwd_input.send_keys(password)
     time.sleep(1)
 
-    for sel in ['#passwordNext', 'button[jsname="LgbsSe"]', 'button[type="button"]']:
-        try:
-            driver.find_element(By.CSS_SELECTOR, sel).click()
-            break
-        except NoSuchElementException:
-            continue
-    time.sleep(4)
+    _click_next_web(driver)
+    logger.info("Password submitted — waiting for next page")
+    time.sleep(6)
+
+    current_url = driver.current_url
+    logger.info("Post-password URL: %s", current_url[:120])
 
     # --- 2FA / TOTP ---
     try:
         totp_input = short_wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, 'input[name="totpPin"], input[id="totpPin"], input[type="tel"]')
+            (By.CSS_SELECTOR,
+             'input[name="totpPin"], input[id="totpPin"], '
+             'input[type="tel"], input[aria-label*="code"], '
+             'input[aria-label*="Code"]')
         ))
-        logger.info("2FA screen — entering TOTP")
+        logger.info("2FA screen — entering TOTP code")
         totp_input.clear()
         totp_input.send_keys(totp_code)
         time.sleep(1)
-        for sel in ['button[jsname="LgbsSe"]', '#totpNext', 'button[type="button"]']:
-            try:
-                driver.find_element(By.CSS_SELECTOR, sel).click()
-                break
-            except NoSuchElementException:
-                continue
-        time.sleep(3)
+        _click_next_web(driver)
+        time.sleep(5)
+        logger.info("TOTP submitted")
     except TimeoutException:
-        logger.info("No 2FA screen detected")
+        logger.info("No TOTP screen — continuing")
 
-    # Verify signed in by checking current URL
     current_url = driver.current_url
-    logger.info("Post-login URL: %s", current_url)
-    if "accounts.google.com" in current_url and "signin" in current_url:
-        # Still on sign-in page — login may have failed
-        page_text = driver.find_element(By.TAG_NAME, "body").text[:300]
-        raise RuntimeError(f"Google sign-in failed. Page: {page_text}")
+    logger.info("Final sign-in URL: %s", current_url[:120])
+    if "accounts.google.com" in current_url and ("signin" in current_url or "challenge" in current_url):
+        body = ""
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text[:400]
+        except Exception:
+            pass
+        raise RuntimeError(f"Google sign-in did not complete. URL: {current_url}\n{body}")
     logger.info("Google sign-in successful")
 
 
-# ---------------------------------------------------------------------------
-# Google One offer link extraction
-# ---------------------------------------------------------------------------
-
-def _extract_offer_from_chrome(driver) -> Optional[str]:
-    """Try to find the offer link on one.google.com via Chrome."""
+def _click_next_web(driver) -> None:
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import NoSuchElementException
+    for sel in [
+        '#identifierNext button',
+        '#passwordNext button',
+        'button[jsname="LgbsSe"]',
+        '#totpNext button',
+        'button[type="submit"]',
+        'button[type="button"]',
+    ]:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            btn.click()
+            return
+        except NoSuchElementException:
+            continue
+    # JS fallback
+    try:
+        driver.execute_script(
+            "document.querySelector('button[type=\"submit\"], "
+            "button[type=\"button\"]').click()"
+        )
+    except Exception:
+        pass
 
-    logger.info("Opening one.google.com in Chrome")
+
+# ---------------------------------------------------------------------------
+# Google One offer extraction
+# ---------------------------------------------------------------------------
+
+def _find_offer_in_chrome(driver) -> Optional[str]:
+    from selenium.webdriver.common.by import By
+
+    logger.info("Navigating to one.google.com")
     driver.get("https://one.google.com")
-    time.sleep(5)
+    time.sleep(6)
 
-    # Look for the offer link in page source
-    for _ in range(6):
+    for scroll in range(6):
         source = driver.page_source
         match = OFFER_RE.search(source)
         if match:
-            url = match.group(0).rstrip(".,;)")
-            logger.info("Found offer link in Chrome: %s", url)
+            url = match.group(0).rstrip(".,;)'\"")
+            logger.info("Offer link found on one.google.com: %s", url)
             return url
-        # Try scrolling to load more content
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(3)
 
-    # Try clicking on upgrade/Gemini sections
-    for text in ["Gemini Pro", "Gemini Advanced", "Upgrade", "Benefits", "Claim"]:
+    # Try clicking Gemini/Upgrade sections
+    for text in ["Gemini Pro", "Gemini Advanced", "Upgrade", "Claim", "Benefits"]:
         try:
-            els = driver.find_elements(By.XPATH, f'//*[contains(text(), "{text}")]')
-            for el in els:
+            els = driver.find_elements(
+                By.XPATH, f'//*[contains(text(), "{text}")]'
+            )
+            for el in els[:3]:
                 try:
                     el.click()
-                    time.sleep(3)
-                    source = driver.page_source
-                    match = OFFER_RE.search(source)
-                    if match:
-                        return match.group(0).rstrip(".,;)")
-                    driver.get("https://one.google.com")
                     time.sleep(4)
+                    match = OFFER_RE.search(driver.page_source)
+                    if match:
+                        return match.group(0).rstrip(".,;)'\"")
+                    driver.back()
+                    time.sleep(2)
                     break
                 except Exception:
                     pass
@@ -298,16 +363,14 @@ def _extract_offer_from_chrome(driver) -> Optional[str]:
     return None
 
 
-def _extract_offer_from_native_app(driver_native) -> Optional[str]:
-    """Open Google One native app and look for the offer link."""
+def _find_offer_in_native_app(driver_native) -> Optional[str]:
     from appium.webdriver.common.appiumby import AppiumBy
 
     PACKAGE = "com.google.android.apps.subscriptions.red"
     logger.info("Launching Google One native app")
     driver_native.activate_app(PACKAGE)
-    time.sleep(5)
+    time.sleep(6)
 
-    # Dismiss any dialogs
     for text in ["Not now", "Skip", "Maybe later", "Got it", "No thanks"]:
         try:
             driver_native.find_element(
@@ -317,43 +380,38 @@ def _extract_offer_from_native_app(driver_native) -> Optional[str]:
         except Exception:
             pass
 
-    # Search page source and element tree for the offer URL
-    for attempt in range(5):
+    for attempt in range(6):
         source = driver_native.page_source
         match = OFFER_RE.search(source)
         if match:
-            return match.group(0).rstrip(".,;)")
+            return match.group(0).rstrip(".,;)'\"")
 
-        # Try scrolling
         try:
             driver_native.swipe(540, 1500, 540, 500, 800)
         except Exception:
             pass
         time.sleep(3)
 
-        # Try navigating to different tabs
         if attempt == 2:
-            for tab in ["Upgrade", "Benefits", "Plans"]:
+            for tab in ["Upgrade", "Benefits", "Plans", "Gemini"]:
                 try:
                     driver_native.find_element(
                         AppiumBy.XPATH, f'//android.widget.TextView[@text="{tab}"]'
                     ).click()
-                    time.sleep(2)
+                    time.sleep(3)
                     break
                 except Exception:
                     pass
-
     return None
 
 
 def _connect_native_appium(retries: int = 3, wait: int = 10):
-    """Connect to the native Android UiAutomator2 driver."""
     from appium import webdriver
     from appium.options.android import UiAutomator2Options
 
     options = UiAutomator2Options()
     options.platform_name = "Android"
-    options.device_name = "emulator-5554"
+    options.device_name = DEVICE
     options.no_reset = True
     options.full_reset = False
     options.auto_grant_permissions = True
@@ -388,7 +446,6 @@ def main(job_id: str) -> None:
     job = doc.to_dict()
     user_id = job.get("user_id", "")
 
-    # Decrypt credentials
     email = _decrypt(job["email_encrypted"])
     password = _decrypt(job["password_encrypted"])
     two_fa_key = _decrypt(job["two_fa_encrypted"])
@@ -398,42 +455,40 @@ def main(job_id: str) -> None:
     db.collection("jobs").document(job_id).update({"status": "processing"})
     _log_event(db, job_id, "automation_start", "Emulator automation started")
 
-    # Enable Chrome debugging on emulator
-    _enable_chrome_debugging()
+    # Step 1: Prepare the emulator
+    _setup_device()
+    _log_event(db, job_id, "device_setup", "Device spoofed as Pixel 10, Chrome flags set")
 
     chrome_driver = None
     native_driver = None
     offer_link = None
 
     try:
-        # Step 1: Sign in via Chrome browser
+        # Step 2: Sign in via Chrome on the emulator
         chrome_driver = _connect_chrome()
         _sign_in_via_chrome(chrome_driver, email, password, totp_code)
-        _log_event(db, job_id, "google_signin", "Signed in via Chrome browser")
+        _log_event(db, job_id, "google_signin", "Signed in via Chrome on Android emulator")
 
-        # Step 2: Try to get offer link from one.google.com in Chrome
-        offer_link = _extract_offer_from_chrome(chrome_driver)
+        # Step 3: Try Google One web
+        offer_link = _find_offer_in_chrome(chrome_driver)
 
         if offer_link:
-            _log_event(db, job_id, "offer_link_found", f"Found in Chrome: {offer_link}")
+            _log_event(db, job_id, "offer_found", f"Found via web: {offer_link}")
         else:
-            # Step 3: Sync account to device and try native Google One app
-            logger.info("Offer not found in Chrome — trying native app after account sync")
+            # Step 4: Try native Google One app
+            logger.info("Not found on web — trying native Google One app")
             chrome_driver.quit()
             chrome_driver = None
-
-            # Wait for account to sync to Android account manager
-            time.sleep(10)
+            time.sleep(5)
 
             native_driver = _connect_native_appium()
-            offer_link = _extract_offer_from_native_app(native_driver)
+            offer_link = _find_offer_in_native_app(native_driver)
             if offer_link:
-                _log_event(db, job_id, "offer_link_found", f"Found in native app: {offer_link}")
+                _log_event(db, job_id, "offer_found", f"Found in native app: {offer_link}")
 
         if not offer_link:
-            raise RuntimeError("Offer link not found in Chrome or native Google One app")
+            raise RuntimeError("Offer link not found in web or native Google One app")
 
-        # Save result
         db.collection("jobs").document(job_id).update({
             "status": "completed",
             "offer_link": offer_link,
