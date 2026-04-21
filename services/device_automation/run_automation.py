@@ -143,6 +143,12 @@ def _connect_chrome(retries: int = 4, wait: int = 10):
     options.set_capability("chromedriverAutodownload", True)
     options.new_command_timeout = 300
 
+    # Use pre-downloaded ChromeDriver 113 if available (matches emulator Chrome)
+    cd_path = os.environ.get("CHROMEDRIVER_PATH", "")
+    if cd_path and os.path.isfile(cd_path):
+        logger.info("Using pre-downloaded ChromeDriver: %s", cd_path)
+        options.set_capability("chromedriverExecutable", cd_path)
+
     server = "http://127.0.0.1:4723"
     last_exc = None
     for attempt in range(1, retries + 1):
