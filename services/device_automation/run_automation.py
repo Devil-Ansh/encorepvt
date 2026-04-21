@@ -134,9 +134,9 @@ def _enable_chrome_debugging() -> None:
 def _connect_chrome(retries: int = 4, wait: int = 10):
     """Connect Appium to Chrome browser on the emulator via ChromeDriver."""
     from appium import webdriver
-    from appium.options.android import ChromeOptions
+    from appium.options.android import UiAutomator2Options
 
-    options = ChromeOptions()
+    options = UiAutomator2Options()
     options.platform_name = "Android"
     options.device_name = "emulator-5554"
     options.browser_name = "Chrome"
