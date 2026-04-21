@@ -55,12 +55,10 @@ jobs:
 
       - name: Start Appium server
         run: |
-          appium --address 127.0.0.1 --port 4723 \
-            --allow-insecure chromedriver_autodownload \
-            --log /tmp/appium.log &
+          appium --address 127.0.0.1 --port 4723 --log /tmp/appium.log &
           echo "Appium PID=$!" >> $GITHUB_ENV
-          sleep 3
-          echo "Appium started with chromedriver_autodownload enabled"
+          sleep 4
+          curl -s http://127.0.0.1:4723/status | python3 -c "import sys,json; d=json.load(sys.stdin); print('Appium ready:', d.get('value',{}).get('ready',False))"
 
       - name: Run automation with Android emulator
         uses: reactivecircus/android-emulator-runner@v2
